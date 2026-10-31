@@ -7,9 +7,8 @@ Harness that runs in a container and uses an agent running on a remote ollama se
 ## Instructions
 
 Running the harness
-- Run `tunnel.sh` on the host and keep it running 
-  - This establishes the ssh tunnel to the ollama server
-- Run `harness.sh` to start the harness
+- Run `prompt.sh` on the host. It configures container DNS when needed, starts the SSH tunnel and container, and presents the prompt.
+- Enter Ctrl-D to stop the harness and clean up the tunnel.
 
 Building the container image
 - Run `build.sh` to create the image
