@@ -7,6 +7,11 @@ import sys
 
 WORK_DIR = Path('/work').resolve()
 
+URL= 'http://host.container.internal:11435/api/chat'
+MODEL = 'qwen3.8:27b'
+
+SYSTEM_PROMPT = (WORK_DIR / 'AGENTS.md').read_text(encoding='utf-8')
+
 def run_command(command: str) -> str:
   if not command.strip():
     return 'Error: command cannot be empty'
@@ -31,9 +36,6 @@ def run_command(command: str) -> str:
     f'stdout:\n{result.stdout}\n'
     f'stderr:\n{result.stderr}'
   )
-
-URL= 'http://host.container.internal:11435/api/chat'
-MODEL = 'qwen3.8:27b'
 
 def web_search(query: str, max_results: int | None = None) -> str:
   arguments: dict[str, Any] = {'query': query}
@@ -67,6 +69,7 @@ TOOLS = {
   'run_command': run_command,
   'web_search': web_search
 }
+
 TOOLS_SCHEMA = [
   {
     'type': 'function',
@@ -121,10 +124,10 @@ def send_prompt(messages: list[dict[str, Any]]) -> None:
 
     thinking = ''
     is_thinking = False
-    
+
     reply = ''
     is_reply = False
-    
+
     tool_calls = []
 
     with requests.post(URL, json=payload, stream=True) as response:
@@ -205,10 +208,6 @@ def send_prompt(messages: list[dict[str, Any]]) -> None:
 
 def emit_output(text: str) -> None:
   print(json.dumps({'type': 'output', 'text': text}), flush=True)
-
-SYSTEM_PROMPT = """For python
-- Add type information
-- Use two space indentation"""
 
 def run_worker() -> None:
   messages = []
