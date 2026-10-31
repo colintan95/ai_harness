@@ -179,6 +179,8 @@ def send_output(writer: IO[str], text: str) -> None:
 def handle_prompt(
   messages: list[dict[str, Any]], reader: IO[str], writer: IO[str]
 ) -> None:
+  last_prompt_eval_count: int | None = None
+
   while True:
     payload: dict[str, Any] = {
       'model': MODEL,
@@ -188,10 +190,11 @@ def handle_prompt(
       'stream': True
     }
 
+    current_token_count = None
+
     thinking = ''
     reply = ''
     mode: str | None = None
-
     tool_calls = []
 
     with requests.post(OLLAMA_URL, json=payload, stream=True) as response:
@@ -202,6 +205,12 @@ def handle_prompt(
           continue
 
         chunk = json.loads(line)
+
+        token_count = chunk.get('prompt_eval_count')
+        if (isinstance(token_count, int)
+            and not isinstance(token_count, bool)):
+          current_token_count = token_count
+
         message = chunk.get('message', {})
 
         # We assume here that the model won't interleave thinking and reply
@@ -255,6 +264,8 @@ def handle_prompt(
 
     # Stop the loop once there aren't any tool calls left
     if not tool_calls:
+      if current_token_count is not None:
+        send_output(writer, f'Current token count: {current_token_count}\n\n')
       break
 
     for call in tool_calls:

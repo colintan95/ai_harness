@@ -1,7 +1,6 @@
 from typing import Any
 import subprocess
 
-
 def stop_process(process: subprocess.Popen[Any]) -> None:
   if process.poll() is None:
     process.terminate()
