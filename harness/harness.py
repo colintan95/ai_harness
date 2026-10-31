@@ -35,8 +35,37 @@ def run_command(command: str) -> str:
 URL= 'http://host.container.internal:11435/api/chat'
 MODEL = 'qwen3.8:27b'
 
+def web_search(query: str, max_results: int | None = None) -> str:
+  arguments: dict[str, Any] = {'query': query}
+  if max_results is not None:
+    arguments['max_results'] = max_results
+
+  print(json.dumps({
+    'type': 'web_search',
+    'arguments': arguments
+  }), flush=True)
+
+  line = sys.stdin.readline()
+  if not line:
+    return 'Error: host closed the input before returning web search results'
+
+  try:
+    response = json.loads(line)
+  except json.JSONDecodeError:
+    return 'Error: received an invalid response from the host'
+
+  if not isinstance(response, dict) or response.get('type') != 'host_response':
+    return 'Error: received an unexpected response from the host'
+
+  result = response.get('result')
+  if not isinstance(result, str):
+    return 'Error: host returned an invalid web search result'
+
+  return result
+
 TOOLS = {
-  'run_command': run_command
+  'run_command': run_command,
+  'web_search': web_search
 }
 TOOLS_SCHEMA = [
   {
@@ -53,6 +82,28 @@ TOOLS_SCHEMA = [
           }
         },
         'required': ['command']
+      }
+    }
+  },
+  {
+    'type': 'function',
+    'function': {
+      'name': 'web_search',
+      'description': 'Search the web with DDGS for current information.',
+      'parameters': {
+        'type': 'object',
+        'properties': {
+          'query': {
+            'type': 'string',
+            'description': 'The web search query'
+          },
+          'max_results': {
+            'type': 'integer',
+            'description': 'Maximum number of results to return',
+            'default': 3
+          }
+        },
+        'required': ['query']
       }
     }
   }

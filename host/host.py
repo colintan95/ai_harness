@@ -1,6 +1,8 @@
+from ddgs import DDGS
+
 from pathlib import Path
 from types import FrameType
-from typing import Any
+from typing import Any, TextIO
 import atexit
 import json
 import shlex
@@ -17,6 +19,23 @@ WORK_DIR = REPO_DIR / 'tmp'
 
 DNS_DOMAIN = 'host.container.internal'
 DNS_LOCALHOST = '203.0.113.113'
+
+def web_search(query: str, max_results: int | None = None) -> str:
+  if not query.strip():
+    return 'Error: query must be a non-empty string'
+  
+  if max_results is None:
+    max_results = 3
+
+  if max_results < 1:
+    return 'Error: max_results must be a positive integer'
+
+  try:
+    results = DDGS().text(query, max_results=max_results)
+  except Exception as error:
+    return f'Error: web search failed: {error}'
+
+  return json.dumps(results, ensure_ascii=False, indent=2)
 
 def dns_is_configured() -> bool:
   try:
@@ -106,7 +125,9 @@ def wait_for_harness(process: subprocess.Popen[str]) -> bool:
 
   return True
 
-def display_harness_response(process: subprocess.Popen[str]) -> bool:
+def display_harness_response(
+  process: subprocess.Popen[str], stdin: TextIO
+) -> bool:
   while True:
     event = read_harness_event(process)
     if event is None:
@@ -123,6 +144,33 @@ def display_harness_response(process: subprocess.Popen[str]) -> bool:
 
     elif event_type == 'error':
       print(event.get('text', 'Harness error'), file=sys.stderr)
+
+    elif event_type == 'web_search':
+      arguments = event.get('arguments')
+
+      if not isinstance(arguments, dict):
+        result = 'Error: web_search arguments must be an object'
+      else:
+        query = arguments.get('query')
+        max_results = arguments.get('max_results')
+        
+        if not isinstance(query, str):
+          result = 'Error: query must be a string'
+        elif (max_results is not None
+              and (not isinstance(max_results, int)
+                   or isinstance(max_results, bool))):
+          result = 'Error: max_results must be a positive integer'
+        else:
+          result = web_search(query, max_results)
+
+      try:
+        stdin.write(
+          json.dumps({'type': 'host_response', 'result': result}) + '\n'
+        )
+        stdin.flush()
+      except OSError as error:
+        print(f'Error returning host tool result: {error}', file=sys.stderr)
+        return False
 
     elif event_type == 'done':
       return True
@@ -177,8 +225,9 @@ def run_harness() -> None:
       print(f'Error sending prompt to harness: {error}', file=sys.stderr)
       break
 
-    if not display_harness_response(process):
+    if not display_harness_response(process, stdin):
       break
+    
     print()
 
   try:
@@ -201,7 +250,7 @@ def main() -> None:
   if dns_is_configured():
     print('Container access to the host is already configured.')
   else:
-    print('Configuring container access to host SSH tunnel...', flush=True)
+    print('Configuring container access to host SSH tunnel...')
     try:
       subprocess.run([
         'sudo', 'container', 'system', 'dns', 'create', DNS_DOMAIN,
@@ -211,7 +260,7 @@ def main() -> None:
     except OSError as error:
       print(f'Error running sudo: {error}', file=sys.stderr)
 
-  print('Starting SSH tunnel on port 11435...', flush=True)
+  print('Starting SSH tunnel on port 11435...')
 
   signal.signal(signal.SIGTERM, stop_on_sigterm)
   try:
@@ -223,6 +272,8 @@ def main() -> None:
     return
   
   atexit.register(stop_process, ssh_process)
+
+  print()
 
   run_harness()
 
