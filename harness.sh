@@ -1,11 +1,10 @@
 #!/usr/bin/env bash
 
-# Details:
-# - Run with stdin with the `-it` flag
-# - Mounts the `src` directory as `readonly` - so the agent can't modify the
-#     harness code
-# - Mounts `src` as `/harness` in the container
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+
+# Make sure the `src` folder is mounted as readonly
 container run -it --rm \
-  --mount "type=bind,source=$PWD/src,target=/harness,readonly" \
-  --workdir /harness \
-  ai-harness:latest python harness.py
+  --mount "type=bind,source=$SCRIPT_DIR/src,target=/harness,readonly" \
+  --mount "type=bind,source=$SCRIPT_DIR/tmp,target=/work" \
+  --workdir /work \
+  ai-harness:latest python /harness/harness.py

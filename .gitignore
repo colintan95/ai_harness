@@ -1,2 +1,4 @@
 /env/local.env
 AGENTS.md
+.mypy_cache/
+/tmp
