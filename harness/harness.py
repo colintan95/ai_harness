@@ -1,14 +1,17 @@
 from pathlib import Path
-from typing import Any, TypedDict
+from typing import Any, IO, TypedDict
+import argparse
 import base64
 import json
 import requests
+import socket
 import subprocess
-import sys
 
 WORK_DIR = Path('/work').resolve()
 
-URL= 'http://host.container.internal:11435/api/chat'
+HOSTNAME = 'host.container.internal'
+OLLAMA_URL= f'http://{HOSTNAME}:11435/api/chat'
+
 MODEL = 'qwen3.8:27b'
 
 SYSTEM_PROMPT = (WORK_DIR / 'AGENTS.md').read_text(encoding='utf-8')
@@ -38,17 +41,23 @@ def run_command(command: str) -> str:
     f'stderr:\n{result.stderr}'
   )
 
-def web_search(query: str, max_results: int | None = None) -> str:
+def send_event(writer: IO[str], event: dict[str, Any]) -> None:
+  writer.write(json.dumps(event) + '\n')
+  writer.flush()
+
+def web_search(
+  query: str,
+  reader: IO[str],
+  writer: IO[str],
+  max_results: int | None = None
+) -> str:
   arguments: dict[str, Any] = {'query': query}
   if max_results is not None:
     arguments['max_results'] = max_results
 
-  print(json.dumps({
-    'type': 'web_search',
-    'arguments': arguments
-  }), flush=True)
+  send_event(writer, {'type': 'web_search', 'arguments': arguments})
 
-  line = sys.stdin.readline()
+  line = reader.readline()
   if not line:
     return 'Error: host closed the input before returning web search results'
 
@@ -57,7 +66,7 @@ def web_search(query: str, max_results: int | None = None) -> str:
   except json.JSONDecodeError:
     return 'Error: received an invalid response from the host'
 
-  if not isinstance(response, dict) or response.get('type') != 'host_response':
+  if not isinstance(response, dict) or response.get('type') != 'response':
     return 'Error: received an unexpected response from the host'
 
   result = response.get('result')
@@ -72,10 +81,10 @@ class ImageToolResult(TypedDict):
 
 def view_image(path: str) -> ImageToolResult:
   if not isinstance(path, str) or not path.strip():
-    return {'content': 'Error: provide an image path inside /work', 'images': []}
+    return {'content': 'Error: provide an image path inside /work', 
+            'images': []}
 
   image_path = (WORK_DIR / path).resolve()
-
   try:
     image_path.relative_to(WORK_DIR)
   except ValueError:
@@ -164,7 +173,12 @@ TOOLS_SCHEMA = [
   }
 ]
 
-def send_prompt(messages: list[dict[str, Any]]) -> None:
+def send_output(writer: IO[str], text: str) -> None:
+  send_event(writer, {'type': 'output', 'text': text})
+
+def handle_prompt(
+  messages: list[dict[str, Any]], reader: IO[str], writer: IO[str]
+) -> None:
   while True:
     payload: dict[str, Any] = {
       'model': MODEL,
@@ -180,7 +194,7 @@ def send_prompt(messages: list[dict[str, Any]]) -> None:
 
     tool_calls = []
 
-    with requests.post(URL, json=payload, stream=True) as response:
+    with requests.post(OLLAMA_URL, json=payload, stream=True) as response:
       response.raise_for_status()
 
       for line in response.iter_lines():
@@ -191,7 +205,8 @@ def send_prompt(messages: list[dict[str, Any]]) -> None:
         message = chunk.get('message', {})
 
         # We assume here that the model won't interleave thinking and reply
-        # chunks
+        # chunks - and that whenever the chunk changes to the other type we
+        # can change the mode
 
         thought = message.get('thinking', '')
         thinking += thought
@@ -208,23 +223,23 @@ def send_prompt(messages: list[dict[str, Any]]) -> None:
 
           # Create a line gap when switching between thinking and replies
           if mode and mode != new_mode:
-            emit_output('\n\n')
+            send_output(writer, '\n\n')
 
           mode = new_mode
 
         if thought:
           DARK_GRAY = '\033[38;5;240m'
           RESET = '\033[0m'
-          emit_output(f'{DARK_GRAY}{thought}{RESET}')
+          send_output(writer, f'{DARK_GRAY}{thought}{RESET}')
         
         if content:
-          emit_output(content)
+          send_output(writer, content)
 
         tool_calls.extend(message.get('tool_calls', []))
 
     # Add a line gap after the last thinking or reply from the request
     if thinking or reply:
-      emit_output('\n\n')
+      send_output(writer, '\n\n')
 
     agent_msg: dict[str, Any] = {
       'role': 'assistant',
@@ -252,7 +267,7 @@ def send_prompt(messages: list[dict[str, Any]]) -> None:
       if name == 'run_command':
         content = run_command(**args)
       elif name == 'web_search':
-        content = web_search(**args)
+        content = web_search(**args, reader=reader, writer=writer)
       elif name == 'view_image':
         result = view_image(**args)
         content = result['content']
@@ -271,30 +286,40 @@ def send_prompt(messages: list[dict[str, Any]]) -> None:
 
       messages.append(tool_msg)
 
-def emit_output(text: str) -> None:
-  print(json.dumps({'type': 'output', 'text': text}), flush=True)
-
-def run_worker() -> None:
+def run_worker(host_port: int) -> None:
   messages = []
   if SYSTEM_PROMPT:
     messages.append({'role': 'system', 'content': SYSTEM_PROMPT})
 
-  print(json.dumps({'type': 'ready'}), flush=True)
-  for line in sys.stdin:
-    try:
-      request = json.loads(line)
-      message = request.get('message')
-      
-      if not isinstance(message, str):
-        raise ValueError('Request must contain a string message')
+  with socket.create_connection((HOSTNAME, host_port), timeout=30) as conn:
+    conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    conn.settimeout(None)
 
-      messages.append({'role': 'user', 'content': message})
-      send_prompt(messages)
+    reader = conn.makefile('r', encoding='utf-8')
+    writer = conn.makefile('w', encoding='utf-8')
 
-    except Exception as error:
-      print(json.dumps({'type': 'error', 'text': str(error)}), flush=True)
+    with reader, writer:
+      send_event(writer, {'type': 'ready'})
 
-    print(json.dumps({'type': 'done'}), flush=True)
+      # The loop ends when the host closes the connection
+      for line in reader:
+        try:
+          request = json.loads(line)
+          prompt = request.get('prompt')
+
+          if not isinstance(prompt, str):
+            raise ValueError('Request must contain a string message')
+
+          messages.append({'role': 'user', 'content': prompt})
+          handle_prompt(messages, reader, writer)
+
+        except Exception as error:
+          send_event(writer, {'type': 'error', 'text': str(error)})
+
+        send_event(writer, {'type': 'done'})
 
 if __name__ == '__main__':
-  run_worker()
+  parser = argparse.ArgumentParser()
+  parser.add_argument('--host-port', type=int, required=True)
+  
+  run_worker(parser.parse_args().host_port)

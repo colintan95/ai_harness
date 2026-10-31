@@ -9,21 +9,6 @@ import sys
 DNS_DOMAIN = 'host.container.internal'
 DNS_LOCALHOST = '203.0.113.113'
 
-def start_ssh_tunnel(config_file: Path) -> bool:
-  if not config_file.is_file():
-    print('Create env/local.env from env/local.env.example', file=sys.stderr)
-    return False
-
-  ssh_target = read_ssh_target(config_file)
-  if not ssh_target:
-    print('Set SSH_TARGET in env/local.env', file=sys.stderr)
-    return False
-
-  if not configure_container_dns():
-    return False
-
-  return start_ssh_process(ssh_target)
-
 def read_ssh_target(config_file: Path) -> str | None:
   try:
     lines = config_file.read_text().splitlines()
@@ -55,10 +40,10 @@ def read_ssh_target(config_file: Path) -> str | None:
 
 def configure_container_dns() -> bool:
   if dns_is_configured():
-    print('Container access to host SSH tunnel is already configured.')
+    print('Container access to host network is already configured.')
     return True
 
-  print('Configuring container access to host SSH tunnel...')
+  print('Configuring container access to host network...')
   try:
     subprocess.run([
       'sudo', 'container', 'system', 'dns', 'create', DNS_DOMAIN,
@@ -99,3 +84,18 @@ def start_ssh_process(ssh_target: str) -> bool:
 
   atexit.register(stop_process, process)
   return True
+
+def configure_connections(config_file: Path) -> bool:
+  if not config_file.is_file():
+    print('Create env/local.env from env/local.env.example', file=sys.stderr)
+    return False
+
+  ssh_target = read_ssh_target(config_file)
+  if not ssh_target:
+    print('Set SSH_TARGET in env/local.env', file=sys.stderr)
+    return False
+
+  if not configure_container_dns():
+    return False
+
+  return start_ssh_process(ssh_target)
