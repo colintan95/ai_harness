@@ -1,5 +1,6 @@
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, TypedDict
+import base64
 import json
 import requests
 import subprocess
@@ -65,10 +66,44 @@ def web_search(query: str, max_results: int | None = None) -> str:
 
   return result
 
-TOOLS: dict[str, Callable[..., str]] = {
-  'run_command': run_command,
-  'web_search': web_search
-}
+class ImageToolResult(TypedDict):
+  content: str
+  images: list[str]
+
+def view_image(path: str) -> ImageToolResult:
+  if not isinstance(path, str) or not path.strip():
+    return {'content': 'Error: provide an image path inside /work', 'images': []}
+
+  image_path = (WORK_DIR / path).resolve()
+
+  try:
+    image_path.relative_to(WORK_DIR)
+  except ValueError:
+    return {'content': 'Error: image must be inside /work', 'images': []}
+
+  if not image_path.is_file():
+    return {'content': f'Error: image not found: {path}', 'images': []}
+
+  IMAGE_SUFFIXES = {'.png', '.jpg', '.jpeg', '.webp'}
+  if image_path.suffix.lower() not in IMAGE_SUFFIXES:
+    return {
+      'content': 'Error: use a PNG, JPEG, or WebP image',
+      'images': []
+    }
+
+  MAX_IMAGE_BYTES = 12 * 1024 * 1024
+  try:
+    if image_path.stat().st_size > MAX_IMAGE_BYTES:
+      return {'content': 'Error: image is too large', 'images': []}
+    image = base64.b64encode(image_path.read_bytes()).decode('ascii')
+
+  except OSError as error:
+    return {'content': f'Error reading image: {error}', 'images': []}
+
+  return {
+    'content': f'Attached image: {image_path.name}',
+    'images': [image]
+  }
 
 TOOLS_SCHEMA = [
   {
@@ -107,6 +142,23 @@ TOOLS_SCHEMA = [
           }
         },
         'required': ['query']
+      }
+    }
+  },
+  {
+    'type': 'function',
+    'function': {
+      'name': 'view_image',
+      'description': 'Attaches an image from /work so you can inspect it.',
+      'parameters': {
+        'type': 'object',
+        'properties': {
+          'path': {
+            'type': 'string',
+            'description': 'Image path inside /work, e.g. screenshots/error.png'
+          }
+        },
+        'required': ['path']
       }
     }
   }
@@ -179,13 +231,11 @@ def send_prompt(messages: list[dict[str, Any]]) -> None:
       'content': reply
     }
 
-    if thinking:
-      agent_msg['thinking'] = thinking
-      
     if tool_calls:
       agent_msg['tool_calls'] = tool_calls
 
-    # Save the message from the agent
+    # TODO: Check if we're ever adding any blank messages from the agent -
+    # e.g. if the request had no reply or it was all thought
     messages.append(agent_msg)
 
     # Stop the loop once there aren't any tool calls left
@@ -196,17 +246,30 @@ def send_prompt(messages: list[dict[str, Any]]) -> None:
       fn = call['function']
       name, args = fn['name'], fn['arguments']
 
-      tool = TOOLS.get(name)
-      if tool is None:
-        result = f'Unknown tool {name}'
-      else:
-        result = tool(**args)
+      content = ''
+      images = []
 
-      messages.append({
+      if name == 'run_command':
+        content = run_command(**args)
+      elif name == 'web_search':
+        content = web_search(**args)
+      elif name == 'view_image':
+        result = view_image(**args)
+        content = result['content']
+        if result['images']:
+          images = result['images']
+      else:
+        content = f'Unknown tool {name}'
+
+      tool_msg: dict[str, Any] = {
         'role': 'tool',
         'tool_name': name,
-        'content': str(result)
-      })
+        'content': content
+      }
+      if images:
+        tool_msg['images'] = images
+
+      messages.append(tool_msg)
 
 def emit_output(text: str) -> None:
   print(json.dumps({'type': 'output', 'text': text}), flush=True)
