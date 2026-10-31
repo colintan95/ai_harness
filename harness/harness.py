@@ -1,5 +1,5 @@
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 import json
 import requests
 import subprocess
@@ -65,7 +65,7 @@ def web_search(query: str, max_results: int | None = None) -> str:
 
   return result
 
-TOOLS = {
+TOOLS: dict[str, Callable[..., str]] = {
   'run_command': run_command,
   'web_search': web_search
 }
@@ -123,10 +123,8 @@ def send_prompt(messages: list[dict[str, Any]]) -> None:
     }
 
     thinking = ''
-    is_thinking = False
-
     reply = ''
-    is_reply = False
+    mode: str | None = None
 
     tool_calls = []
 
@@ -140,37 +138,41 @@ def send_prompt(messages: list[dict[str, Any]]) -> None:
         chunk = json.loads(line)
         message = chunk.get('message', {})
 
+        # We assume here that the model won't interleave thinking and reply
+        # chunks
+
         thought = message.get('thinking', '')
         thinking += thought
 
-        if thought:
-          if is_reply:
+        content = message.get('content', '')
+        reply += content
+
+        # A chunk with no thought or content shouldn't affect the mode
+        if thought or content:
+          if thought:
+            new_mode = 'thinking'
+          else:
+            new_mode = 'reply'
+
+          # Create a line gap when switching between thinking and replies
+          if mode and mode != new_mode:
             emit_output('\n\n')
-            is_reply = False
 
-          is_thinking = True
+          mode = new_mode
 
+        if thought:
           DARK_GRAY = '\033[38;5;240m'
           RESET = '\033[0m'
           emit_output(f'{DARK_GRAY}{thought}{RESET}')
         
-        content = message.get('content', '')
-        reply += content
-
-        # Apply line breaks to split the thoughts and the actual reply
-        if content and is_thinking:
-          is_thinking = False
-          emit_output('\n\n')
-
         if content:
-          is_reply = True
           emit_output(content)
 
         tool_calls.extend(message.get('tool_calls', []))
 
-    # If there was a reply, add a newline at the end of it
-    if reply:
-      emit_output('\n')
+    # Add a line gap after the last thinking or reply from the request
+    if thinking or reply:
+      emit_output('\n\n')
 
     agent_msg: dict[str, Any] = {
       'role': 'assistant',

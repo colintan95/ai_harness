@@ -2,7 +2,7 @@ from ddgs import DDGS
 
 from pathlib import Path
 from types import FrameType
-from typing import Any, TextIO
+from typing import Any, IO
 import atexit
 import json
 import shlex
@@ -126,7 +126,7 @@ def wait_for_harness(process: subprocess.Popen[str]) -> bool:
   return True
 
 def display_harness_response(
-  process: subprocess.Popen[str], stdin: TextIO
+  process: subprocess.Popen[str], stdin: IO[str]
 ) -> bool:
   while True:
     event = read_harness_event(process)
@@ -213,10 +213,10 @@ def run_harness() -> None:
     try:
       message = input('>>> ')
     except EOFError:
-      print()
+      print(flush=True)
       break
 
-    print()
+    print(flush=True)
 
     try:
       stdin.write(json.dumps({'message': message}) + '\n')
@@ -227,8 +227,6 @@ def run_harness() -> None:
 
     if not display_harness_response(process, stdin):
       break
-    
-    print()
 
   try:
     stdin.close()
