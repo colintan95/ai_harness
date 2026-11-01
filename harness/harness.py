@@ -205,10 +205,15 @@ def handle_prompt(
 
         chunk = json.loads(line)
 
-        token_count = chunk.get('prompt_eval_count')
-        if (isinstance(token_count, int)
-            and not isinstance(token_count, bool)):
-          current_token_count = token_count
+        # 'prompt_eval_count' is the input token count while 'eval_count' is the
+        # output token count
+        prompt_eval_count = chunk.get('prompt_eval_count', 0)
+        eval_count = chunk.get('eval_count', 0)
+        if (isinstance(prompt_eval_count, int)
+            and not isinstance(prompt_eval_count, bool)
+            and isinstance(eval_count, int)
+            and not isinstance(eval_count, bool)):
+          current_token_count = prompt_eval_count + eval_count
 
         message = chunk.get('message', {})
 
@@ -254,6 +259,14 @@ def handle_prompt(
       'content': reply
     }
 
+    # Though chain of thought takes up a lot of context, it's quite impt for
+    # cases like when the model performs a tool call in the middle of its
+    # reasoning - else when the tool returns it'll forget what it was thinking
+    if thinking:
+      agent_msg['thinking'] = thinking
+
+    # TODO: See if there's stale data that can be discarded from the context -
+    # e.g. if the agent rereads a file
     if tool_calls:
       agent_msg['tool_calls'] = tool_calls
 
