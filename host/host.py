@@ -1,7 +1,6 @@
 from connection import configure_connections
 from utils import stop_process
 
-from ddgs import DDGS
 from prompt_toolkit import PromptSession
 from prompt_toolkit.key_binding import KeyBindings
 
@@ -22,23 +21,6 @@ CONFIG_FILE = REPO_DIR / 'env' / 'local.env'
 
 HARNESS_DIR = REPO_DIR / 'harness'
 WORK_DIR = REPO_DIR / 'tmp'
-
-def web_search(query: str, max_results: int | None = None) -> str:
-  if not query.strip():
-    return 'Error: query must be a non-empty string'
-  
-  if max_results is None:
-    max_results = 3
-
-  if max_results < 1:
-    return 'Error: max_results must be a positive integer'
-
-  try:
-    results = DDGS().text(query, max_results=max_results)
-  except Exception as error:
-    return f'Error: web search failed: {error}'
-
-  return json.dumps(results, ensure_ascii=False, indent=2)
 
 def read_event(reader: IO[str]) -> dict[str, Any] | None:
   # Blocks until the harness sends an event back
@@ -70,7 +52,7 @@ def wait_for_harness_ready(reader: IO[str]) -> bool:
 
   return True
 
-def handle_responses(reader: IO[str], writer: IO[str]) -> bool:
+def handle_responses(reader: IO[str]) -> bool:
   while True:
     event = read_event(reader)
     if event is None:
@@ -87,33 +69,6 @@ def handle_responses(reader: IO[str], writer: IO[str]) -> bool:
 
     elif event_type == 'error':
       print(event.get('text', 'Harness error'), file=sys.stderr)
-
-    elif event_type == 'web_search':
-      arguments = event.get('arguments')
-
-      if not isinstance(arguments, dict):
-        result = 'Error: web_search arguments must be an object'
-      else:
-        query = arguments.get('query')
-        max_results = arguments.get('max_results')
-        
-        if not isinstance(query, str):
-          result = 'Error: query must be a string'
-        elif (max_results is not None
-              and (not isinstance(max_results, int)
-                   or isinstance(max_results, bool))):
-          result = 'Error: max_results must be a positive integer'
-        else:
-          result = web_search(query, max_results)
-
-      try:
-        writer.write(
-          json.dumps({'type': 'response', 'result': result}) + '\n'
-        )
-        writer.flush()
-      except OSError as error:
-        print(f'Error returning host tool result: {error}', file=sys.stderr)
-        return False
 
     elif event_type == 'done':
       return True
@@ -221,7 +176,7 @@ def run_harness() -> None:
           break
 
         # Handle the responses from the harness until it says it's done
-        if not handle_responses(reader, writer):
+        if not handle_responses(reader):
           break
 
   # Wait until the harness has shut down

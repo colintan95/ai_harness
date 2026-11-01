@@ -1,9 +1,11 @@
+from ddgs import DDGS
+import requests
+
 from pathlib import Path
 from typing import Any, IO, TypedDict
 import argparse
 import base64
 import json
-import requests
 import socket
 import subprocess
 
@@ -46,35 +48,23 @@ def send_event(writer: IO[str], event: dict[str, Any]) -> None:
   writer.write(json.dumps(event) + '\n')
   writer.flush()
 
-def web_search(
-  query: str,
-  reader: IO[str],
-  writer: IO[str],
-  max_results: int | None = None
-) -> str:
-  arguments: dict[str, Any] = {'query': query}
-  if max_results is not None:
-    arguments['max_results'] = max_results
+def web_search(query: str, max_results: int | None = None) -> str:
+  if not isinstance(query, str) or not query.strip():
+    return 'Error: query must be a non-empty string'
 
-  send_event(writer, {'type': 'web_search', 'arguments': arguments})
-
-  line = reader.readline()
-  if not line:
-    return 'Error: host closed the input before returning web search results'
+  if max_results is None:
+    max_results = 3
+  elif (not isinstance(max_results, int)
+        or isinstance(max_results, bool)
+        or max_results < 1):
+    return 'Error: max_results must be a positive integer'
 
   try:
-    response = json.loads(line)
-  except json.JSONDecodeError:
-    return 'Error: received an invalid response from the host'
+    results = DDGS().text(query, max_results=max_results)
+  except Exception as error:
+    return f'Error: web search failed: {error}'
 
-  if not isinstance(response, dict) or response.get('type') != 'response':
-    return 'Error: received an unexpected response from the host'
-
-  result = response.get('result')
-  if not isinstance(result, str):
-    return 'Error: host returned an invalid web search result'
-
-  return result
+  return json.dumps(results, ensure_ascii=False, indent=2)
 
 class ImageToolResult(TypedDict):
   content: str
@@ -177,9 +167,7 @@ TOOLS_SCHEMA = [
 def send_output(writer: IO[str], text: str) -> None:
   send_event(writer, {'type': 'output', 'text': text})
 
-def handle_prompt(
-  messages: list[dict[str, Any]], reader: IO[str], writer: IO[str]
-) -> None:
+def handle_prompt(messages: list[dict[str, Any]], writer: IO[str]) -> None:
   while True:
     payload: dict[str, Any] = {
       'model': MODEL,
@@ -259,9 +247,14 @@ def handle_prompt(
       'content': reply
     }
 
-    # Though chain of thought takes up a lot of context, it's quite impt for
-    # cases like when the model performs a tool call in the middle of its
-    # reasoning - else when the tool returns it'll forget what it was thinking
+    # TODO: See if there are cases that the model degenerates cos we discard
+    # its chain of thought, and see how we can deal with that without having
+    # to waste its context on all its thoughts. E.g. if the model calls a tool
+    # within its chain of thought - since we would discard all its thoughts
+    # before the tool call
+
+    # TODO: Experiment around with whether we should include thinking or not
+    # in the context window
     if thinking:
       agent_msg['thinking'] = thinking
 
@@ -295,7 +288,7 @@ def handle_prompt(
       if name == 'run_command':
         content = run_command(**args)
       elif name == 'web_search':
-        content = web_search(**args, reader=reader, writer=writer)
+        content = web_search(**args)
       elif name == 'view_image':
         result = view_image(**args)
         content = result['content']
@@ -339,7 +332,7 @@ def run_worker(host_port: int) -> None:
             raise ValueError('Request must contain a string message')
 
           messages.append({'role': 'user', 'content': prompt})
-          handle_prompt(messages, reader, writer)
+          handle_prompt(messages, writer)
 
         except Exception as error:
           send_event(writer, {'type': 'error', 'text': str(error)})
