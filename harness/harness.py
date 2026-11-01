@@ -20,6 +20,7 @@ def run_command(command: str) -> str:
   if not command.strip():
     return 'Error: command cannot be empty'
 
+  # TODO: Figure out what the working dir should be, or how to get and set it
   try:
     result = subprocess.run(
       command,
@@ -179,8 +180,6 @@ def send_output(writer: IO[str], text: str) -> None:
 def handle_prompt(
   messages: list[dict[str, Any]], reader: IO[str], writer: IO[str]
 ) -> None:
-  last_prompt_eval_count: int | None = None
-
   while True:
     payload: dict[str, Any] = {
       'model': MODEL,
@@ -271,6 +270,11 @@ def handle_prompt(
     for call in tool_calls:
       fn = call['function']
       name, args = fn['name'], fn['arguments']
+
+      send_output(
+        writer,
+        f'Calling tool: {name}({json.dumps(args, ensure_ascii=False)})\n\n'
+      )
 
       content = ''
       images = []

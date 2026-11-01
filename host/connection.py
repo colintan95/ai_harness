@@ -45,6 +45,12 @@ def configure_container_dns() -> bool:
 
   print('Configuring container access to host network...')
   try:
+    # TODO: Figure out what the security implications are of opening up
+    # localhost to the container - or if there's a better way to do this
+    #
+    # One other way is to make a broker in another container that talks to
+    # the ollama server and other network related stuff, and then have the
+    # agent talk to that broker
     subprocess.run([
       'sudo', 'container', 'system', 'dns', 'create', DNS_DOMAIN,
       '--localhost', DNS_LOCALHOST
@@ -75,6 +81,7 @@ def dns_is_configured() -> bool:
 def start_ssh_process(ssh_target: str) -> bool:
   print('Starting SSH tunnel on port 11435...')
   try:
+    # Tunnel port 11435 of locallhost to the ollama server
     process = subprocess.Popen([
       'ssh', '-N', '-L', '11435:127.0.0.1:11434', ssh_target
     ], stdin=subprocess.DEVNULL)
