@@ -79,7 +79,7 @@ def dns_is_configured() -> bool:
   return DNS_DOMAIN in {line.strip() for line in result.stdout.splitlines()}
 
 def start_ssh_process(ssh_target: str) -> bool:
-  print('Starting SSH tunnel on port 11435...')
+  print('Starting SSH tunnel on port 11435...', end='\n\n', flush=True)
   try:
     # Tunnel port 11435 of locallhost to the ollama server
     process = subprocess.Popen([

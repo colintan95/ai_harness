@@ -208,7 +208,7 @@ def main() -> None:
   # ssh tunnel to the ollama server
   if not configure_connections(CONFIG_FILE):
     return
-  print()
+  print(f'{work_dir} mapped to /work', flush=True)
 
   run_harness(work_dir)
 
