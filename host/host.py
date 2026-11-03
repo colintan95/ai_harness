@@ -71,6 +71,8 @@ def handle_responses(reader: IO[str]) -> bool:
       print(event.get('text', 'Harness error'), file=sys.stderr)
 
     elif event_type == 'done':
+      # Ring the terminal bell once the model has completed
+      print('\a', end='', flush=True)
       return True
 
 def run_harness() -> None:
@@ -153,7 +155,7 @@ def run_harness() -> None:
         else:
           event.app.exit(exception=EOFError)
 
-      prompt_session = PromptSession(
+      prompt_session: PromptSession[str] = PromptSession(
         key_bindings=prompt_bindings,
         multiline=True
       )

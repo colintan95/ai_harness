@@ -44,10 +44,6 @@ def run_command(command: str) -> str:
     f'stderr:\n{result.stderr}'
   )
 
-def send_event(writer: IO[str], event: dict[str, Any]) -> None:
-  writer.write(json.dumps(event) + '\n')
-  writer.flush()
-
 def web_search(query: str, max_results: int | None = None) -> str:
   if not isinstance(query, str) or not query.strip():
     return 'Error: query must be a non-empty string'
@@ -163,6 +159,10 @@ TOOLS_SCHEMA = [
     }
   }
 ]
+
+def send_event(writer: IO[str], event: dict[str, Any]) -> None:
+  writer.write(json.dumps(event) + '\n')
+  writer.flush()
 
 def send_output(writer: IO[str], text: str) -> None:
   send_event(writer, {'type': 'output', 'text': text})
