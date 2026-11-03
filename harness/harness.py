@@ -16,8 +16,6 @@ OLLAMA_URL= f'http://{HOSTNAME}:11435/api/chat'
 
 MODEL = 'qwen3.8:27b'
 
-SYSTEM_PROMPT = (WORK_DIR / 'AGENTS.md').read_text(encoding='utf-8')
-
 def run_command(command: str) -> str:
   if not command.strip():
     return 'Error: command cannot be empty'
@@ -307,10 +305,10 @@ def handle_prompt(messages: list[dict[str, Any]], writer: IO[str]) -> None:
 
       messages.append(tool_msg)
 
-def run_worker(host_port: int) -> None:
+def run_worker(host_port: int, system_prompt: str) -> None:
   messages = []
-  if SYSTEM_PROMPT:
-    messages.append({'role': 'system', 'content': SYSTEM_PROMPT})
+  if system_prompt:
+    messages.append({'role': 'system', 'content': system_prompt})
 
   with socket.create_connection((HOSTNAME, host_port), timeout=30) as conn:
     conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
@@ -339,8 +337,20 @@ def run_worker(host_port: int) -> None:
 
         send_event(writer, {'type': 'done'})
 
-if __name__ == '__main__':
+def main() -> None:
   parser = argparse.ArgumentParser()
   parser.add_argument('--host-port', type=int, required=True)
-  
-  run_worker(parser.parse_args().host_port)
+
+  args = parser.parse_args()
+  agents_file = WORK_DIR / 'AGENTS.md'
+  if agents_file.is_file():
+    system_prompt = agents_file.read_text(encoding='utf-8')
+    print(f'Loaded AGENTS.md from {agents_file.resolve()}', end='\n\n', flush=True)
+  else:
+    system_prompt = ''
+    print(f'No AGENTS.md found at {agents_file.resolve()}', end='\n\n', flush=True)
+
+  run_worker(args.host_port, system_prompt)
+
+if __name__ == '__main__':
+  main()

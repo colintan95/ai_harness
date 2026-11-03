@@ -7,6 +7,7 @@ from prompt_toolkit.key_binding import KeyBindings
 from pathlib import Path
 from types import FrameType
 from typing import Any, IO
+import argparse
 import atexit
 import json
 import signal
@@ -20,7 +21,6 @@ REPO_DIR = SCRIPT_DIR.parent
 CONFIG_FILE = REPO_DIR / 'env' / 'local.env'
 
 HARNESS_DIR = REPO_DIR / 'harness'
-WORK_DIR = REPO_DIR / 'tmp'
 
 def read_event(reader: IO[str]) -> dict[str, Any] | None:
   # Blocks until the harness sends an event back
@@ -75,7 +75,7 @@ def handle_responses(reader: IO[str]) -> bool:
       print('\a', end='', flush=True)
       return True
 
-def run_harness() -> None:
+def run_harness(work_dir: Path) -> None:
   listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
   listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 
@@ -94,7 +94,7 @@ def run_harness() -> None:
   command = [
     'container', 'run', '--rm', '--progress', 'none',
     '--mount', f'type=bind,source={HARNESS_DIR},target=/harness,readonly',
-    '--mount', f'type=bind,source={WORK_DIR},target=/work',
+    '--mount', f'type=bind,source={work_dir},target=/work',
     '--workdir', '/work',
     'ai-harness:latest',
     'python', '/harness/harness.py', '--host-port', str(port)
@@ -188,6 +188,19 @@ def stop_on_sigterm(signum: int, frame: FrameType | None) -> None:
   raise SystemExit
 
 def main() -> None:
+  parser = argparse.ArgumentParser(
+    description='Run the harness with a host folder mounted at /work.'
+  )
+  parser.add_argument(
+    'work_dir',
+    type=Path,
+    help='host folder to mount at /work'
+  )
+  args = parser.parse_args()
+  work_dir = args.work_dir.expanduser().resolve()
+  if not work_dir.is_dir():
+    parser.error(f'work folder does not exist or is not a directory: {work_dir}')
+
   # So that the atexit() cleanup handles are called on program end
   signal.signal(signal.SIGTERM, stop_on_sigterm)
 
@@ -197,7 +210,7 @@ def main() -> None:
     return
   print()
 
-  run_harness()
+  run_harness(work_dir)
 
 if __name__ == '__main__':
   main()
