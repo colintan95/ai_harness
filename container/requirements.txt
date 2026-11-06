@@ -1,2 +1,5 @@
 requests
 ddgs
+numpy
+pandas
+matplotlib
