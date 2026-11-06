@@ -3,3 +3,4 @@ ddgs
 numpy
 pandas
 matplotlib
+pyte
