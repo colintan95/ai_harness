@@ -22,6 +22,30 @@ CONFIG_FILE = REPO_DIR / 'env' / 'local.env'
 
 HARNESS_DIR = REPO_DIR / 'harness'
 
+def ensure_container_system_running() -> bool:
+  try:
+    status = subprocess.run(
+      ['container', 'system', 'status'],
+      stdout=subprocess.DEVNULL,
+      stderr=subprocess.DEVNULL,
+      check=False
+    )
+  except OSError as error:
+    print(f'Error checking container system status: {error}', file=sys.stderr)
+    return False
+
+  if status.returncode == 0:
+    return True
+
+  print('Container system is not running; starting it...', flush=True)
+  try:
+    subprocess.run(['container', 'system', 'start'], check=True)
+  except (OSError, subprocess.CalledProcessError) as error:
+    print(f'Error starting container system: {error}', file=sys.stderr)
+    return False
+
+  return True
+
 def read_event(reader: IO[str]) -> dict[str, Any] | None:
   # Blocks until the harness sends an event back
   line = reader.readline()
@@ -203,6 +227,9 @@ def main() -> None:
 
   # So that the atexit() cleanup handles are called on program end
   signal.signal(signal.SIGTERM, stop_on_sigterm)
+
+  if not ensure_container_system_running():
+    return
 
   # Establishes the connection from the harness to the host as well as the
   # ssh tunnel to the ollama server
