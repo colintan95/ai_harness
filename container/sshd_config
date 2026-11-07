@@ -1,0 +1,18 @@
+Port 22
+LogLevel ERROR
+HostKey /run/sshd/host_key
+AuthorizedKeysFile /root/.ssh/authorized_keys
+PermitRootLogin prohibit-password
+AllowUsers root
+PubkeyAuthentication yes
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+AuthenticationMethods publickey
+UsePAM no
+AllowAgentForwarding no
+X11Forwarding no
+PermitTTY no
+AllowTcpForwarding remote
+GatewayPorts no
+PermitListen 127.0.0.1:9000 127.0.0.1:11435
+PermitTunnel no

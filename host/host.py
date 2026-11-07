@@ -1,5 +1,4 @@
 from connection import configure_connections
-from utils import stop_process
 
 from prompt_toolkit import PromptSession
 from prompt_toolkit.key_binding import KeyBindings
@@ -8,7 +7,6 @@ from pathlib import Path
 from types import FrameType
 from typing import Any, IO
 import argparse
-import atexit
 import json
 import signal
 import socket
@@ -99,7 +97,7 @@ def handle_responses(reader: IO[str]) -> bool:
       print('\a', end='', flush=True)
       return True
 
-def run_harness(work_dir: Path) -> None:
+def run_harness(work_dir: Path, backend: str = 'container') -> None:
   listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
   listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 
@@ -111,27 +109,20 @@ def run_harness(work_dir: Path) -> None:
     print(f'Error starting host-harness socket: {error}', file=sys.stderr)
     return
   
-  # Spawn the harness process
-
   port = listener.getsockname()[1]
   listener.settimeout(1)
-  command = [
-    'container', 'run', '--rm', '--progress', 'none',
-    '--mount', f'type=bind,source={HARNESS_DIR},target=/harness,readonly',
-    '--mount', f'type=bind,source={work_dir},target=/work',
-    '--workdir', '/work',
-    'ai-harness:latest',
-    'python', '/harness/harness.py', '--host-port', str(port)
-  ]
   try:
-    process = subprocess.Popen(command, stdin=subprocess.DEVNULL)
-  except OSError as error:
+    with configure_connections(CONFIG_FILE, work_dir, HARNESS_DIR, port, backend) as process:
+      run_session(listener, process)
+  except (OSError, RuntimeError, subprocess.SubprocessError) as error:
+    print(f'Error running harness: {error}', file=sys.stderr)
+  finally:
     listener.close()
-    print(f'Error starting container harness: {error}', file=sys.stderr)
-    return
 
-  atexit.register(stop_process, process)
 
+def run_session(
+  listener: socket.socket, process: subprocess.Popen[bytes]
+) -> None:
   # Wait for the harness to connect
 
   conn: socket.socket | None = None
@@ -161,8 +152,10 @@ def run_harness(work_dir: Path) -> None:
     writer = conn.makefile('w', encoding='utf-8')
 
     with reader, writer:
+      conn.settimeout(10)
       if not wait_for_harness_ready(reader):
         return
+      conn.settimeout(None)
 
       prompt_bindings = KeyBindings()
 
@@ -190,6 +183,7 @@ def run_harness(work_dir: Path) -> None:
         try:
           prompt = prompt_session.prompt('>>> ')
         except EOFError:
+          print(flush=True)
           break
 
         print(flush=True)
@@ -206,38 +200,33 @@ def run_harness(work_dir: Path) -> None:
           break
 
   # Wait until the harness has shut down
-  process.wait()
+  process.wait(timeout=10)
 
 def stop_on_sigterm(signum: int, frame: FrameType | None) -> None:
   raise SystemExit
 
 def main() -> None:
   parser = argparse.ArgumentParser(
-    description='Run the harness with a host folder mounted at /work.'
+    description='Run the harness in a container or a macOS UTM guest.'
   )
   parser.add_argument(
     'work_dir',
     type=Path,
-    help='host folder to mount at /work'
+    help='host workspace folder to share with the worker'
   )
+  parser.add_argument('--backend', choices=['container', 'utm'], default='container')
   args = parser.parse_args()
   work_dir = args.work_dir.expanduser().resolve()
   if not work_dir.is_dir():
     parser.error(f'work folder does not exist or is not a directory: {work_dir}')
 
-  # So that the atexit() cleanup handles are called on program end
+  # Unwind the connection context managers when SIGTERM arrives.
   signal.signal(signal.SIGTERM, stop_on_sigterm)
 
-  if not ensure_container_system_running():
+  if args.backend == 'container' and not ensure_container_system_running():
     return
 
-  # Establishes the connection from the harness to the host as well as the
-  # ssh tunnel to the ollama server
-  if not configure_connections(CONFIG_FILE):
-    return
-  print(f'{work_dir} mapped to /work', flush=True)
-
-  run_harness(work_dir)
+  run_harness(work_dir, args.backend)
 
 if __name__ == '__main__':
   main()

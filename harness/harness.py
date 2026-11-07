@@ -11,7 +11,7 @@ import subprocess
 
 WORK_DIR = Path('/work').resolve()
 
-HOSTNAME = 'host.container.internal'
+HOSTNAME = '127.0.0.1'
 OLLAMA_URL= f'http://{HOSTNAME}:11435/api/chat'
 
 MODEL = 'qwen3.8:27b'
@@ -66,14 +66,14 @@ class ImageToolResult(TypedDict):
 
 def view_image(path: str) -> ImageToolResult:
   if not isinstance(path, str) or not path.strip():
-    return {'content': 'Error: provide an image path inside /work', 
+    return {'content': f'Error: provide an image path inside {WORK_DIR}',
             'images': []}
 
   image_path = (WORK_DIR / path).resolve()
   try:
     image_path.relative_to(WORK_DIR)
   except ValueError:
-    return {'content': 'Error: image must be inside /work', 'images': []}
+    return {'content': f'Error: image must be inside {WORK_DIR}', 'images': []}
 
   if not image_path.is_file():
     return {'content': f'Error: image not found: {path}', 'images': []}
@@ -104,7 +104,7 @@ TOOLS_SCHEMA = [
     'type': 'function',
     'function': {
       'name': 'run_command',
-      'description': 'Executes a CLI command string in /work using the shell.',
+      'description': 'Executes a CLI command string in the workspace using the shell.',
       'parameters': {
         'type': 'object',
         'properties': {
@@ -143,13 +143,13 @@ TOOLS_SCHEMA = [
     'type': 'function',
     'function': {
       'name': 'view_image',
-      'description': 'Attaches an image from /work so you can inspect it.',
+      'description': 'Attaches an image from the workspace so you can inspect it.',
       'parameters': {
         'type': 'object',
         'properties': {
           'path': {
             'type': 'string',
-            'description': 'Image path inside /work, e.g. screenshots/error.png'
+            'description': 'Image path inside the workspace, e.g. screenshots/error.png'
           }
         },
         'required': ['path']
@@ -230,7 +230,7 @@ def handle_prompt(messages: list[dict[str, Any]], writer: IO[str]) -> None:
           DARK_GRAY = '\033[38;5;240m'
           RESET = '\033[0m'
           send_output(writer, f'{DARK_GRAY}{thought}{RESET}')
-        
+
         if content:
           send_output(writer, content)
 
@@ -339,9 +339,18 @@ def run_worker(host_port: int, system_prompt: str) -> None:
 
 def main() -> None:
   parser = argparse.ArgumentParser()
+  parser.add_argument('--work-dir', type=Path, default=Path('/work'))
   parser.add_argument('--host-port', type=int, required=True)
+  parser.add_argument('--host-address', default='127.0.0.1')
+  parser.add_argument('--ollama-url', default='http://127.0.0.1:11435/api/chat')
 
   args = parser.parse_args()
+  global HOSTNAME, OLLAMA_URL, WORK_DIR
+  WORK_DIR = args.work_dir.expanduser().resolve()
+  if not WORK_DIR.is_dir():
+    parser.error(f'workspace is not a directory: {WORK_DIR}')
+  HOSTNAME = args.host_address
+  OLLAMA_URL = args.ollama_url
   agents_file = WORK_DIR / 'AGENTS.md'
   if agents_file.is_file():
     system_prompt = agents_file.read_text(encoding='utf-8')
