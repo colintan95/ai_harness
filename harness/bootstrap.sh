@@ -27,34 +27,37 @@ if sys.version_info < (3, 12):
 PY
 
 test -r "$SCRIPT_DIR/harness.py"
+test -r "$SCRIPT_DIR/service.py"
+test -r "$SCRIPT_DIR/launcher.py"
+test -r "$SCRIPT_DIR/permissions.py"
 test -r "$SCRIPT_DIR/requirements.txt"
 mkdir -p "$INSTALL_DIR" "$WORK_DIR" "$LAUNCH_AGENT_DIR" "$LOG_DIR"
 chmod 700 "$INSTALL_DIR"
-cp "$SCRIPT_DIR/harness.py" "$INSTALL_DIR/harness.py"
-cp "$SCRIPT_DIR/service.py" "$INSTALL_DIR/service.py"
-cp "$SCRIPT_DIR/launcher.py" "$INSTALL_DIR/launcher.py"
-cp "$SCRIPT_DIR/permissions.py" "$INSTALL_DIR/permissions.py"
-cp "$SCRIPT_DIR/requirements.txt" "$INSTALL_DIR/requirements.txt"
 "$PYTHON" -m venv "$INSTALL_DIR/venv"
-"$INSTALL_DIR/venv/bin/python" -m pip install -r "$INSTALL_DIR/requirements.txt"
+"$INSTALL_DIR/venv/bin/python" -m pip install -r "$SCRIPT_DIR/requirements.txt"
 
 VENV_PYTHON="$INSTALL_DIR/venv/bin/python"
-"$PYTHON" - "$INSTALL_DIR" "$WORK_DIR" "$PLIST_PATH" "$AGENT_LABEL" "$LOG_DIR" <<'PY'
+"$PYTHON" - "$INSTALL_DIR" "$SCRIPT_DIR" "$WORK_DIR" "$PLIST_PATH" "$AGENT_LABEL" "$LOG_DIR" <<'PY'
 import plistlib
 import sys
 from pathlib import Path
 
 install_dir = Path(sys.argv[1])
-work_dir = Path(sys.argv[2])
-plist_path = Path(sys.argv[3])
-label = sys.argv[4]
-log_dir = Path(sys.argv[5])
+share_dir = Path(sys.argv[2])
+work_dir = Path(sys.argv[3])
+plist_path = Path(sys.argv[4])
+label = sys.argv[5]
+log_dir = Path(sys.argv[6])
 python = install_dir / 'venv' / 'bin' / 'python'
+service = share_dir / 'service.py'
 plist = {
     'Label': label,
     'ProgramArguments': [
-        str(python), '-u', str(install_dir / 'service.py'),
-        '--install-dir', str(install_dir), '--work-dir', str(work_dir),
+        '/bin/sh', '-c',
+        'while [ ! -r "$2" ]; do sleep 1; done; '
+        'exec "$1" -u "$2" --install-dir "$3" --work-dir "$4"',
+        'ai-harness-wait-for-share', str(python), str(service),
+        str(share_dir), str(work_dir),
     ],
     'WorkingDirectory': str(install_dir),
     'EnvironmentVariables': {

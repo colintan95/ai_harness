@@ -100,6 +100,40 @@ def start_ssh_process(ssh_target: str) -> Iterator[None]:
       stop_process(process)
 
 
+@contextmanager
+def start_guest_tunnel(
+  options: list[str], target: str, callback_port: int,
+) -> Iterator[subprocess.Popen[bytes]]:
+  """Keep the host callback and Ollama reverse forwards alive for one run."""
+  TMP_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
+  with tempfile.TemporaryDirectory(prefix='harness-guest-', dir=TMP_DIR) as directory:
+    control_socket = str(Path(directory) / 'control')
+    process = subprocess.Popen([
+      *options, '-N', '-M', '-S', control_socket,
+      '-o', 'ExitOnForwardFailure=yes',
+      '-R', f'127.0.0.1:9000:127.0.0.1:{callback_port}',
+      '-R', '127.0.0.1:11435:127.0.0.1:11435', target,
+    ], stdin=subprocess.DEVNULL)
+    try:
+      deadline = time.monotonic() + 15
+      while time.monotonic() < deadline:
+        if process.poll() is not None:
+          raise RuntimeError('Guest SSH tunnel exited during startup.')
+        status = subprocess.run(
+          ['ssh', '-S', control_socket, '-O', 'check', target],
+          stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+          stderr=subprocess.DEVNULL, check=False, timeout=2,
+        )
+        if status.returncode == 0 and process.poll() is None:
+          break
+        time.sleep(0.1)
+      else:
+        raise RuntimeError('Timed out starting guest SSH tunnel.')
+      yield process
+    finally:
+      stop_process(process)
+
+
 def applescript(source: str, *arguments: str) -> str:
   try:
     return subprocess.run(
@@ -173,88 +207,74 @@ def vm_worker(
         'Configure UTM to share exactly '
         f'{harness_dir.resolve()} and {work_dir}'
       )
-    process: subprocess.Popen[bytes] | None = None
-    try:
-      print(f'Connecting to running UTM VM {identifier}...', flush=True)
-      print(f'Waiting up to {SSH_TIMEOUT_SECONDS}s for SSH to {target}. Unlock the guest if needed.', flush=True)
-      deadline = time.monotonic() + SSH_TIMEOUT_SECONDS
-      next_report = time.monotonic()
-      last_error = ''
-      while time.monotonic() < deadline:
-        try:
-          probe = subprocess.run(
-            [*options, target, 'true'], stdin=subprocess.DEVNULL,
-            capture_output=True, timeout=8,
-          )
-          if probe.returncode == 0:
-            break
-          last_error = probe.stderr.decode(errors='replace').strip()
-        except subprocess.TimeoutExpired:
-          last_error = 'SSH probe timed out; check guest hostname and networking'
-        if any(message in last_error for message in (
-          'REMOTE HOST IDENTIFICATION HAS CHANGED',
-          'Host key verification failed', 'Permission denied',
-          'UNPROTECTED PRIVATE KEY FILE', 'incorrect passphrase',
-        )):
-          raise RuntimeError(f'VM SSH failed: {last_error}')
-        if time.monotonic() >= next_report:
-          print(f'Waiting for guest SSH: {last_error or "connection not ready"}',
-                file=sys.stderr, flush=True)
-          next_report = time.monotonic() + 10
-        time.sleep(1)
-      else:
-        raise RuntimeError(f'Timed out waiting for VM SSH: {last_error}')
-
-      home = guest_home(options, target)
-      install_dir = home / '.local' / 'share' / 'ai-harness'
-      python = install_dir / 'venv' / 'bin' / 'python'
-      mount_dir = home / 'work'
-
-      print('Guest SSH is ready; updating harness code...', flush=True)
-      # Update the job code through SSH, outside the shared workspace. The
-      # LaunchAgent supervisor and its venv are installed by guest bootstrap.
-      source = harness_dir / 'harness.py'
-      destination = str(Path(install_dir) / source.name)
-      command = f'umask 077; cat > {shlex.quote(destination)}'
-      subprocess.run(
-        [*options, target, command], input=source.read_bytes(),
-        check=True, timeout=30,
-      )
-
-      launcher = str(Path(install_dir) / 'launcher.py')
-      ready = subprocess.run(
-        [*options, target, shlex.join([str(python), '-u', launcher, 'ping'])],
-        stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=15,
-      )
-      if ready.returncode != 0:
-        details = ready.stderr.strip() or ready.stdout.strip()
-        raise RuntimeError(
-          'The GUI LaunchAgent is not ready. Log into the VM desktop and run '
-          f'harness/bootstrap.sh there. {details}'
+    print(f'Connecting to running UTM VM {identifier}...', flush=True)
+    print(f'Waiting up to {SSH_TIMEOUT_SECONDS}s for SSH to {target}. Unlock the guest if needed.', flush=True)
+    deadline = time.monotonic() + SSH_TIMEOUT_SECONDS
+    next_report = time.monotonic()
+    last_error = ''
+    while time.monotonic() < deadline:
+      try:
+        probe = subprocess.run(
+          [*options, target, 'true'], stdin=subprocess.DEVNULL,
+          capture_output=True, timeout=8,
         )
+        if probe.returncode == 0:
+          break
+        last_error = probe.stderr.decode(errors='replace').strip()
+      except subprocess.TimeoutExpired:
+        last_error = 'SSH probe timed out; check guest hostname and networking'
+      if any(message in last_error for message in (
+        'REMOTE HOST IDENTIFICATION HAS CHANGED',
+        'Host key verification failed', 'Permission denied',
+        'UNPROTECTED PRIVATE KEY FILE', 'incorrect passphrase',
+      )):
+        raise RuntimeError(f'VM SSH failed: {last_error}')
+      if time.monotonic() >= next_report:
+        print(f'Waiting for guest SSH: {last_error or "connection not ready"}',
+              file=sys.stderr, flush=True)
+        next_report = time.monotonic() + 10
+      time.sleep(1)
+    else:
+      raise RuntimeError(f'Timed out waiting for VM SSH: {last_error}')
 
-      command = shlex.join([
-        str(python), '-u', launcher, 'run', '--project-relative', '.',
-      ])
-      print('Starting GUI-session worker and reverse tunnels...', flush=True)
-      process = subprocess.Popen([
-        *options,
-        '-R', f'127.0.0.1:9000:127.0.0.1:{callback_port}',
-        '-R', '127.0.0.1:11435:127.0.0.1:11435',
-        target, command,
-      ], stdin=subprocess.PIPE)
+    home = guest_home(options, target)
+    install_dir = home / '.local' / 'share' / 'ai-harness'
+    python = install_dir / 'venv' / 'bin' / 'python'
+    mount_dir = home / 'work'
+    harness_share = PurePosixPath('/Volumes/My Shared Files/harness')
+
+    print('Guest SSH is ready; using the shared harness code...', flush=True)
+
+    launcher = str(harness_share / 'launcher.py')
+    ready = subprocess.run(
+      [*options, target, shlex.join([str(python), '-u', launcher, 'ping'])],
+      stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=15,
+    )
+    if ready.returncode != 0:
+      details = ready.stderr.strip() or ready.stdout.strip()
+      raise RuntimeError(
+        'The GUI LaunchAgent is not ready. Log into the VM desktop and run '
+        f'harness/bootstrap.sh there. {details}'
+      )
+
+    command = shlex.join([
+      str(python), '-u', launcher, 'run', '--project-relative', '.',
+    ])
+    print('Starting GUI-session worker and reverse tunnels...', flush=True)
+    with start_guest_tunnel(options, target, callback_port) as tunnel:
+      launched = subprocess.run(
+        [*options, target, command], stdin=subprocess.DEVNULL,
+        capture_output=True, text=True, check=False, timeout=15,
+      )
+      if launched.stderr:
+        print(launched.stderr, file=sys.stderr, end='', flush=True)
+      if launched.returncode != 0:
+        details = launched.stderr.strip() or launched.stdout.strip()
+        raise RuntimeError(
+          f'Could not launch the GUI-session worker: {details or launched.returncode}'
+        )
       print(f'{work_dir} available in VM at {mount_dir}', flush=True)
-      yield process
-    finally:
-      if process is not None:
-        # EOF makes the SSH-side client disconnect from the GUI LaunchAgent;
-        # the agent closes worker stdin so the harness removes its workspace link.
-        if process.stdin is not None:
-          process.stdin.close()
-        try:
-          process.wait(timeout=15)
-        except subprocess.TimeoutExpired:
-          stop_process(process)
+      yield tunnel
 
 
 @contextmanager

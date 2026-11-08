@@ -2,7 +2,6 @@
 import argparse
 import json
 from pathlib import Path
-import select
 import socket
 import sys
 from typing import Any
@@ -14,30 +13,25 @@ SOCKET_PATH = Path.home() / 'Library' / 'Caches' / 'ai-harness' / 'agent.sock'
 def read_events(sock: socket.socket) -> int:
   buffer = bytearray()
   while True:
-    ready, _, _ = select.select([sock, sys.stdin.buffer], [], [])
-    if sys.stdin.buffer in ready:
-      if not sys.stdin.buffer.read1(4096):
-        # Closing the SSH command's stdin tells the LaunchAgent to stop this run.
+    chunk = sock.recv(4096)
+    if not chunk:
+      raise RuntimeError('GUI LaunchAgent closed the session unexpectedly')
+    buffer.extend(chunk)
+    while b'\n' in buffer:
+      line, _, rest = buffer.partition(b'\n')
+      buffer = bytearray(rest)
+      event = json.loads(line.decode('utf-8'))
+      if not isinstance(event, dict):
+        raise RuntimeError('Invalid response from GUI LaunchAgent')
+      event_type = event.get('type')
+      if event_type == 'started':
+        print('GUI-session worker launched.', file=sys.stderr, flush=True)
         return 0
-    if sock in ready:
-      chunk = sock.recv(4096)
-      if not chunk:
-        raise RuntimeError('GUI LaunchAgent closed the session unexpectedly')
-      buffer.extend(chunk)
-      while b'\n' in buffer:
-        line, _, rest = buffer.partition(b'\n')
-        buffer = bytearray(rest)
-        event = json.loads(line.decode('utf-8'))
-        if not isinstance(event, dict):
-          raise RuntimeError('Invalid response from GUI LaunchAgent')
-        event_type = event.get('type')
-        if event_type == 'started':
-          print('GUI-session worker started.', file=sys.stderr, flush=True)
-        elif event_type == 'error':
-          raise RuntimeError(str(event.get('text', 'GUI LaunchAgent error')))
-        elif event_type == 'done':
-          exit_code = event.get('exit_code', 1)
-          return exit_code if isinstance(exit_code, int) else 1
+      elif event_type == 'error':
+        raise RuntimeError(str(event.get('text', 'GUI LaunchAgent error')))
+      elif event_type == 'done':
+        exit_code = event.get('exit_code', 1)
+        return exit_code if isinstance(exit_code, int) else 1
 
 
 def request(action: str, project_relative: str | None = None) -> int:

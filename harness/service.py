@@ -3,7 +3,6 @@ import argparse
 import json
 import os
 from pathlib import Path
-import select
 import signal
 import socket
 import subprocess
@@ -71,14 +70,17 @@ class Service:
     self.running = True
     self.server: socket.socket | None = None
     self.active_worker: subprocess.Popen[bytes] | None = None
+    self.worker_lock = threading.Lock()
 
   def stop(self, signum: int, frame: object) -> None:
     del signum, frame
     self.running = False
     if self.server is not None:
       self.server.close()
-    if self.active_worker is not None and self.active_worker.poll() is None:
-      stop_worker(self.active_worker)
+    with self.worker_lock:
+      active_worker = self.active_worker
+    if active_worker is not None and active_worker.poll() is None:
+      stop_worker(active_worker)
 
   def start_worker(self, conn: socket.socket, project_relative: str) -> None:
     project_path = Path(project_relative)
@@ -89,6 +91,14 @@ class Service:
     harness_script = self.install_dir / 'harness.py'
     if not harness_script.is_file():
       send_event(conn, {'type': 'error', 'text': f'Missing harness script: {harness_script}'})
+      return
+
+    with self.worker_lock:
+      worker_is_running = (
+        self.active_worker is not None and self.active_worker.poll() is None
+      )
+    if worker_is_running:
+      send_event(conn, {'type': 'error', 'text': 'A worker is already running'})
       return
 
     log_dir = Path.home() / 'Library' / 'Logs' / 'AIHarness'
@@ -113,38 +123,32 @@ class Service:
           env=env,
           start_new_session=True,
         )
-        self.active_worker = process
-        try:
-          send_event(conn, {'type': 'started', 'pid': process.pid})
-          disconnected = False
-          while process.poll() is None:
-            readable, _, _ = select.select([conn], [], [], 0.5)
-            if readable:
-              try:
-                if not conn.recv(4096):
-                  disconnected = True
-                  break
-              except OSError:
-                disconnected = True
-                break
+        with self.worker_lock:
+          self.active_worker = process
 
-          if disconnected and process.poll() is None:
-            stop_worker(process)
-          else:
-            process.wait()
-          try:
-            send_event(conn, {'type': 'done', 'exit_code': process.returncode})
-          except OSError:
-            pass
-        finally:
-          if process.poll() is None:
-            stop_worker(process)
-          self.active_worker = None
+        threading.Thread(
+          target=self.wait_for_worker,
+          args=(process,),
+          name='harness-worker-monitor',
+          daemon=True,
+        ).start()
+        send_event(conn, {'type': 'started', 'pid': process.pid})
     except OSError as error:
       try:
         send_event(conn, {'type': 'error', 'text': f'Could not start worker: {error}'})
       except OSError:
         pass
+
+  def wait_for_worker(self, process: subprocess.Popen[bytes]) -> None:
+    process.wait()
+    if process.stdin is not None and not process.stdin.closed:
+      try:
+        process.stdin.close()
+      except OSError:
+        pass
+    with self.worker_lock:
+      if self.active_worker is process:
+        self.active_worker = None
 
   def handle(self, conn: socket.socket) -> None:
     try:

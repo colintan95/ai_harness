@@ -366,8 +366,8 @@ def run_worker(host_port: int, system_prompt: str, startup_message: str) -> None
     with reader, writer:
       send_event(writer, {'type': 'ready', 'text': startup_message})
 
-      # The session ends when either the host callback or the LaunchAgent
-      # session closes. Watching stdin lets the latter trigger workspace cleanup.
+      # The session ends when the host callback or service worker stdin closes.
+      # Watching stdin lets service shutdown trigger workspace cleanup.
       while True:
         readable, _, _ = select.select([conn, sys.stdin], [], [])
         if sys.stdin in readable and not os.read(sys.stdin.fileno(), 4096):
@@ -376,6 +376,10 @@ def run_worker(host_port: int, system_prompt: str, startup_message: str) -> None
           continue
         line = reader.readline()
         if not line:
+          try:
+            send_event(writer, {'type': 'done', 'session_done': True})
+          except OSError:
+            pass
           break
         try:
           request = json.loads(line)

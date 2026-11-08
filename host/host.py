@@ -78,6 +78,17 @@ def handle_responses(reader: IO[str]) -> bool:
       print('\a', end='', flush=True)
       return True
 
+def wait_for_harness_stopped(reader: IO[str]) -> bool:
+  event = read_event(reader)
+  if event is None:
+    print('The harness connection closed before confirming shutdown.',
+          file=sys.stderr)
+    return False
+  if event.get('type') == 'done' and event.get('session_done') is True:
+    return True
+  print('The harness did not confirm session shutdown.', file=sys.stderr)
+  return False
+
 def run_harness() -> None:
   listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
   listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -180,8 +191,12 @@ def run_session(
         if not handle_responses(reader):
           break
 
-  # Wait until the harness has shut down
-  process.wait(timeout=10)
+      try:
+        conn.shutdown(socket.SHUT_WR)
+      except OSError as error:
+        print(f'Error signaling the harness to stop: {error}', file=sys.stderr)
+      else:
+        wait_for_harness_stopped(reader)
 
 def stop_on_sigterm(signum: int, frame: FrameType | None) -> None:
   raise SystemExit
