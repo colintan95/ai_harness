@@ -19,30 +19,7 @@ REPO_DIR = SCRIPT_DIR.parent
 CONFIG_FILE = REPO_DIR / 'env' / 'local.env'
 
 HARNESS_DIR = REPO_DIR / 'harness'
-
-def ensure_container_system_running() -> bool:
-  try:
-    status = subprocess.run(
-      ['container', 'system', 'status'],
-      stdout=subprocess.DEVNULL,
-      stderr=subprocess.DEVNULL,
-      check=False
-    )
-  except OSError as error:
-    print(f'Error checking container system status: {error}', file=sys.stderr)
-    return False
-
-  if status.returncode == 0:
-    return True
-
-  print('Container system is not running; starting it...', flush=True)
-  try:
-    subprocess.run(['container', 'system', 'start'], check=True)
-  except (OSError, subprocess.CalledProcessError) as error:
-    print(f'Error starting container system: {error}', file=sys.stderr)
-    return False
-
-  return True
+WORK_DIR = Path.home() / 'work'
 
 def read_event(reader: IO[str]) -> dict[str, Any] | None:
   # Blocks until the harness sends an event back
@@ -72,6 +49,10 @@ def wait_for_harness_ready(reader: IO[str]) -> bool:
     print('The harness process did not become ready.', file=sys.stderr)
     return False
 
+  startup_message = event.get('text')
+  if isinstance(startup_message, str) and startup_message:
+    print(startup_message, end='\n\n', flush=True)
+
   return True
 
 def handle_responses(reader: IO[str]) -> bool:
@@ -97,7 +78,7 @@ def handle_responses(reader: IO[str]) -> bool:
       print('\a', end='', flush=True)
       return True
 
-def run_harness(work_dir: Path, backend: str = 'container') -> None:
+def run_harness() -> None:
   listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
   listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 
@@ -112,7 +93,7 @@ def run_harness(work_dir: Path, backend: str = 'container') -> None:
   port = listener.getsockname()[1]
   listener.settimeout(1)
   try:
-    with configure_connections(CONFIG_FILE, work_dir, HARNESS_DIR, port, backend) as process:
+    with configure_connections(CONFIG_FILE, WORK_DIR, HARNESS_DIR, port) as process:
       run_session(listener, process)
   except (OSError, RuntimeError, subprocess.SubprocessError) as error:
     print(f'Error running harness: {error}', file=sys.stderr)
@@ -207,26 +188,20 @@ def stop_on_sigterm(signum: int, frame: FrameType | None) -> None:
 
 def main() -> None:
   parser = argparse.ArgumentParser(
-    description='Run the harness in a container or a macOS UTM guest.'
+    description='Run the harness in a macOS UTM guest.'
   )
-  parser.add_argument(
-    'work_dir',
-    type=Path,
-    help='host workspace folder to share with the worker'
-  )
-  parser.add_argument('--backend', choices=['container', 'utm'], default='container')
-  args = parser.parse_args()
-  work_dir = args.work_dir.expanduser().resolve()
+  parser.parse_args()
+  work_dir = WORK_DIR.expanduser().resolve()
   if not work_dir.is_dir():
-    parser.error(f'work folder does not exist or is not a directory: {work_dir}')
+    parser.error(
+      f'work folder does not exist or is not a directory: {work_dir}. '
+      'Run setup/setup.py to create and share ~/work.'
+    )
 
   # Unwind the connection context managers when SIGTERM arrives.
   signal.signal(signal.SIGTERM, stop_on_sigterm)
 
-  if args.backend == 'container' and not ensure_container_system_running():
-    return
-
-  run_harness(work_dir, args.backend)
+  run_harness()
 
 if __name__ == '__main__':
   main()

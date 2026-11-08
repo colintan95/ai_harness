@@ -1,17 +1,49 @@
-from utils import stop_process
-
+"""Manage the host's SSH connections and UTM VM worker for a session."""
 from contextlib import contextmanager
-from pathlib import Path
-from typing import Iterator
+from pathlib import Path, PurePosixPath
+from typing import Any, Iterator
+import fcntl
 import shlex
-import socket
 import subprocess
 import sys
 import tempfile
 import time
-import uuid
 
 TMP_DIR = Path(__file__).resolve().parent.parent / 'tmp'
+SSH_TIMEOUT_SECONDS = 300
+
+# Arguments are passed separately, never interpolated into AppleScript source.
+INSPECT_VM = '''on run argv
+  local harnessVMRef, harnessVMMatches, harnessShares, harnessSharePaths
+  tell application "UTM"
+    set harnessVMMatches to virtual machines whose id is (item 1 of argv)
+    if (count of harnessVMMatches) is 0 then
+      set harnessVMMatches to virtual machines whose name is (item 1 of argv)
+    end if
+    if (count of harnessVMMatches) is not 1 then error "VM name or UUID must identify one VM"
+    set harnessVMRef to item 1 of harnessVMMatches
+    if backend of harnessVMRef is not apple then error "A macOS Apple backend VM is required"
+    if status of harnessVMRef is not started then error "Start and unlock the harness VM in UTM before connecting"
+    set harnessShares to registry of harnessVMRef
+    if (count of harnessShares) is not 2 then error "Configure exactly two shared directories in UTM"
+    set harnessSharePaths to ""
+    repeat with harnessShare in harnessShares
+      set harnessSharePaths to harnessSharePaths & (POSIX path of harnessShare) & linefeed
+    end repeat
+    return harnessSharePaths
+  end tell
+end run'''
+
+
+def stop_process(process: subprocess.Popen[Any]) -> None:
+  if process.poll() is None:
+    process.terminate()
+    try:
+      process.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+      process.kill()
+      process.wait()
+
 
 def read_config(config_file: Path) -> dict[str, str]:
   """Read literal assignments without executing shell code or expanding variables."""
@@ -68,12 +100,168 @@ def start_ssh_process(ssh_target: str) -> Iterator[None]:
       stop_process(process)
 
 
+def applescript(source: str, *arguments: str) -> str:
+  try:
+    return subprocess.run(
+      ['osascript', '-e', source, *arguments], check=True,
+      capture_output=True, text=True, timeout=30,
+    ).stdout.strip()
+  except subprocess.CalledProcessError as error:
+    raise RuntimeError(f'UTM automation failed: {error.stderr.strip()}') from error
+
+
+def required(config: dict[str, str], name: str) -> str:
+  value = config.get(name, '')
+  if not value:
+    raise RuntimeError(f'Set {name} in env/local.env')
+  return value
+
+
+def guest_options(config: dict[str, str]) -> list[str]:
+  key = Path(required(config, 'VM_SSH_KEY')).expanduser().resolve()
+  if not key.is_file():
+    raise RuntimeError(f'Missing SSH private key: {key}')
+  # Honor normal OpenSSH config and known_hosts, with an explicit VM identity.
+  return [
+    'ssh', '-i', str(key), '-T', '-a', '-x',
+    '-o', 'IdentitiesOnly=yes', '-o', 'BatchMode=yes',
+    '-o', 'ExitOnForwardFailure=yes', '-o', 'ConnectTimeout=3',
+    '-o', 'ServerAliveInterval=10', '-o', 'ServerAliveCountMax=3',
+  ]
+
+
+def guest_home(options: list[str], target: str) -> PurePosixPath:
+  result = subprocess.run(
+    [*options, target, 'printf "%s\\n" "$HOME"'],
+    stdin=subprocess.DEVNULL, capture_output=True, text=True, check=True,
+    timeout=10,
+  )
+  value = result.stdout.strip()
+  if not value.startswith('/') or len(value.splitlines()) != 1:
+    raise RuntimeError('Could not determine an absolute VM home directory')
+  return PurePosixPath(value)
+
+
+@contextmanager
+def vm_worker(
+  config: dict[str, str], work_dir: Path, harness_dir: Path, callback_port: int,
+) -> Iterator[subprocess.Popen[bytes]]:
+  work_dir = work_dir.resolve()
+  identifier = required(config, 'VM_ID')
+  target = required(config, 'VM_SSH_TARGET')
+  if target.startswith('-'):
+    raise RuntimeError('VM_SSH_TARGET cannot start with a dash')
+  options = guest_options(config)
+  if Path(config['VM_SSH_KEY']).expanduser().resolve().is_relative_to(work_dir):
+    raise RuntimeError('VM_SSH_KEY must be outside the shared workspace')
+  # Serialize UTM sessions, including startup, to protect fixed guest ports/share.
+  lock_dir = harness_dir.parent / 'tmp'
+  lock_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+  with (lock_dir / 'utm.lock').open('a') as lock:
+    try:
+      fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError as error:
+      raise RuntimeError('Another UTM harness session is already running') from error
+    configured_shares = {
+      Path(path).resolve()
+      for path in applescript(INSPECT_VM, identifier).splitlines()
+      if path
+    }
+    expected_shares = {harness_dir.resolve(), work_dir}
+    if configured_shares != expected_shares:
+      raise RuntimeError(
+        'Configure UTM to share exactly '
+        f'{harness_dir.resolve()} and {work_dir}'
+      )
+    process: subprocess.Popen[bytes] | None = None
+    try:
+      print(f'Connecting to running UTM VM {identifier}...', flush=True)
+      print(f'Waiting up to {SSH_TIMEOUT_SECONDS}s for SSH to {target}. Unlock the guest if needed.', flush=True)
+      deadline = time.monotonic() + SSH_TIMEOUT_SECONDS
+      next_report = time.monotonic()
+      last_error = ''
+      while time.monotonic() < deadline:
+        try:
+          probe = subprocess.run(
+            [*options, target, 'true'], stdin=subprocess.DEVNULL,
+            capture_output=True, timeout=8,
+          )
+          if probe.returncode == 0:
+            break
+          last_error = probe.stderr.decode(errors='replace').strip()
+        except subprocess.TimeoutExpired:
+          last_error = 'SSH probe timed out; check guest hostname and networking'
+        if any(message in last_error for message in (
+          'REMOTE HOST IDENTIFICATION HAS CHANGED',
+          'Host key verification failed', 'Permission denied',
+          'UNPROTECTED PRIVATE KEY FILE', 'incorrect passphrase',
+        )):
+          raise RuntimeError(f'VM SSH failed: {last_error}')
+        if time.monotonic() >= next_report:
+          print(f'Waiting for guest SSH: {last_error or "connection not ready"}',
+                file=sys.stderr, flush=True)
+          next_report = time.monotonic() + 10
+        time.sleep(1)
+      else:
+        raise RuntimeError(f'Timed out waiting for VM SSH: {last_error}')
+
+      home = guest_home(options, target)
+      install_dir = home / '.local' / 'share' / 'ai-harness'
+      python = install_dir / 'venv' / 'bin' / 'python'
+      mount_dir = home / 'work'
+
+      print('Guest SSH is ready; updating harness code...', flush=True)
+      # Update the job code through SSH, outside the shared workspace. The
+      # LaunchAgent supervisor and its venv are installed by guest bootstrap.
+      source = harness_dir / 'harness.py'
+      destination = str(Path(install_dir) / source.name)
+      command = f'umask 077; cat > {shlex.quote(destination)}'
+      subprocess.run(
+        [*options, target, command], input=source.read_bytes(),
+        check=True, timeout=30,
+      )
+
+      launcher = str(Path(install_dir) / 'launcher.py')
+      ready = subprocess.run(
+        [*options, target, shlex.join([str(python), '-u', launcher, 'ping'])],
+        stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=15,
+      )
+      if ready.returncode != 0:
+        details = ready.stderr.strip() or ready.stdout.strip()
+        raise RuntimeError(
+          'The GUI LaunchAgent is not ready. Log into the VM desktop and run '
+          f'harness/bootstrap.sh there. {details}'
+        )
+
+      command = shlex.join([
+        str(python), '-u', launcher, 'run', '--project-relative', '.',
+      ])
+      print('Starting GUI-session worker and reverse tunnels...', flush=True)
+      process = subprocess.Popen([
+        *options,
+        '-R', f'127.0.0.1:9000:127.0.0.1:{callback_port}',
+        '-R', '127.0.0.1:11435:127.0.0.1:11435',
+        target, command,
+      ], stdin=subprocess.PIPE)
+      print(f'{work_dir} available in VM at {mount_dir}', flush=True)
+      yield process
+    finally:
+      if process is not None:
+        # EOF makes the SSH-side client disconnect from the GUI LaunchAgent;
+        # the agent closes worker stdin so the harness removes its workspace link.
+        if process.stdin is not None:
+          process.stdin.close()
+        try:
+          process.wait(timeout=15)
+        except subprocess.TimeoutExpired:
+          stop_process(process)
+
+
 @contextmanager
 def configure_connections(
   config_file: Path, work_dir: Path, harness_dir: Path, callback_port: int,
-  backend: str = 'container'
 ) -> Iterator[subprocess.Popen[bytes]]:
-  """Own both SSH connections and the selected worker for one session."""
+  """Own the SSH connections and VM worker for one session."""
   if not config_file.is_file():
     raise RuntimeError('Create env/local.env from env/local.env.example')
 
@@ -82,142 +270,7 @@ def configure_connections(
   if not ssh_target:
     raise RuntimeError('Set SSH_TARGET in env/local.env')
 
-  if backend == 'utm':
-    from vm import vm_worker
-    worker = vm_worker(config, work_dir, harness_dir, callback_port)
-  elif backend == 'container':
-    worker = container_worker(work_dir, harness_dir, callback_port)
-  else:
-    raise RuntimeError(f'Unknown backend: {backend}')
-
+  worker = vm_worker(config, work_dir, harness_dir, callback_port)
   with start_ssh_process(ssh_target):
     with worker as process:
       yield process
-
-
-def run_checked(command: list[str]) -> str:
-  return subprocess.run(
-    command, check=True, capture_output=True, text=True, timeout=10
-  ).stdout.strip()
-
-
-def ssh_options(key: Path, known_hosts: Path, port: int) -> list[str]:
-  return [
-    'ssh', '-F', '/dev/null', '-T', '-a', '-x',
-    '-i', str(key), '-p', str(port),
-    '-o', 'IdentitiesOnly=yes', '-o', 'BatchMode=yes',
-    '-o', 'StrictHostKeyChecking=yes',
-    '-o', f'UserKnownHostsFile={known_hosts}',
-    '-o', 'GlobalKnownHostsFile=/dev/null',
-    '-o', 'HostKeyAlias=harness-container',
-    '-o', 'ExitOnForwardFailure=yes', '-o', 'ConnectTimeout=2',
-    '-o', 'ServerAliveInterval=10', '-o', 'ServerAliveCountMax=3',
-  ]
-
-
-@contextmanager
-def container_worker(
-  work_dir: Path, harness_dir: Path, callback_port: int
-) -> Iterator[subprocess.Popen[bytes]]:
-  name = f'ai-harness-{uuid.uuid4().hex}'
-  ssh_process: subprocess.Popen[bytes] | None = None
-  container_process: subprocess.Popen[bytes] | None = None
-
-  def cleanup() -> None:
-    if ssh_process is not None:
-      stop_process(ssh_process)
-    if container_process is not None:
-      # Stop the actual container, not just its attached CLI process.
-      try:
-        subprocess.run(
-          ['container', 'stop', '--time', '2', name],
-          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-          check=False, timeout=10,
-        )
-      finally:
-        stop_process(container_process)
-
-  TMP_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
-  with tempfile.TemporaryDirectory(prefix='ai-harness-ssh-', dir=TMP_DIR) as directory:
-    session_dir = Path(directory)
-    key = session_dir / 'client_key'
-    run_checked(['ssh-keygen', '-q', '-t', 'ed25519', '-N', '', '-f', str(key)])
-    # The runtime requires directory mounts. Keep the private key outside
-    # the mounted directory; expose only the public key to the container.
-    public_dir = session_dir / 'public'
-    public_dir.mkdir()
-    (public_dir / 'client_key.pub').write_bytes(key.with_suffix('.pub').read_bytes())
-    # Reserve a candidate loopback port. The runtime reports bind conflicts;
-    # no unverified SSH connection is made if another service takes it.
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as reservation:
-      reservation.bind(('127.0.0.1', 0))
-      ssh_port = reservation.getsockname()[1]
-
-    command = [
-      'container', 'run', '--rm', '--name', name, '--progress', 'none',
-      '--publish', f'127.0.0.1:{ssh_port}:22',
-      '--mount', f'type=bind,source={harness_dir},target=/harness,readonly',
-      '--mount', f'type=bind,source={harness_dir.parent / "container"},target=/run/container-config,readonly',
-      '--mount', f'type=bind,source={work_dir},target=/work',
-      '--mount', f'type=bind,source={public_dir},target=/run/worker-keys,readonly',
-      '--workdir', '/work', 'ai-harness:latest',
-      '/bin/sh', '/run/container-config/start-sshd.sh',
-      '/run/container-config/sshd_config',
-    ]
-    try:
-      container_process = subprocess.Popen(command, stdin=subprocess.DEVNULL)
-      deadline = time.monotonic() + 60
-      host_key = ''
-      while time.monotonic() < deadline:
-        if container_process.poll() is not None:
-          raise RuntimeError('Container exited before SSH became ready.')
-        try:
-          host_key = run_checked([
-            'container', 'exec', name, 'cat', '/run/sshd/host_key.pub'
-          ])
-          if host_key:
-            break
-        except subprocess.CalledProcessError:
-          pass
-        time.sleep(0.2)
-      if not host_key:
-        raise RuntimeError('Timed out reading container SSH host key.')
-      print(f'{work_dir} mapped to /work', flush=True)
-      parts = host_key.split()
-      if len(parts) < 2 or parts[0] != 'ssh-ed25519':
-        raise RuntimeError('Invalid container SSH host key.')
-      known_hosts = session_dir / 'known_hosts'
-      known_hosts.write_text(f'harness-container {parts[0]} {parts[1]}\n')
-      options = ssh_options(key, known_hosts, ssh_port)
-      # Authenticate before opening the worker session. No keyscan or TOFU:
-      # the host key above was obtained through the trusted container runtime.
-      while time.monotonic() < deadline:
-        if container_process.poll() is not None:
-          raise RuntimeError('Container exited during SSH startup.')
-        probe = subprocess.run(
-          [*options, 'root@127.0.0.1', 'true'],
-          stdin=subprocess.DEVNULL, capture_output=True, timeout=5,
-        )
-        if probe.returncode == 0:
-          break
-        error = probe.stderr.decode('utf-8', errors='replace').strip()
-        if error:
-          print(error, file=sys.stderr, flush=True)
-        time.sleep(0.2)
-      else:
-        raise RuntimeError('Timed out authenticating to container SSH server.')
-
-      worker_command = shlex.join([
-        '/usr/local/bin/python', '-u', '/harness/harness.py',
-        '--host-address', '127.0.0.1', '--host-port', '9000',
-        '--ollama-url', 'http://127.0.0.1:11435/api/chat',
-      ])
-      ssh_process = subprocess.Popen([
-        *options,
-        '-R', f'127.0.0.1:9000:127.0.0.1:{callback_port}',
-        '-R', '127.0.0.1:11435:127.0.0.1:11435',
-        'root@127.0.0.1', worker_command,
-      ], stdin=subprocess.DEVNULL)
-      yield ssh_process
-    finally:
-      cleanup()

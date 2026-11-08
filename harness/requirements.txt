@@ -1,0 +1,4 @@
+requests
+ddgs
+Pillow
+pyautogui

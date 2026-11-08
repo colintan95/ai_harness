@@ -1,15 +1,21 @@
 from ddgs import DDGS
 import requests
 
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, IO, TypedDict
+from types import FrameType
+from typing import Any, IO, Iterator, TypedDict
 import argparse
 import base64
 import json
+import os
+import select
+import signal
 import socket
 import subprocess
+import sys
 
-WORK_DIR = Path('/work').resolve()
+WORK_DIR = Path.home() / 'work'
 
 HOSTNAME = '127.0.0.1'
 OLLAMA_URL= f'http://{HOSTNAME}:11435/api/chat'
@@ -20,7 +26,6 @@ def run_command(command: str) -> str:
   if not command.strip():
     return 'Error: command cannot be empty'
 
-  # TODO: Figure out what the working dir should be, or how to get and set it
   try:
     result = subprocess.run(
       command,
@@ -98,6 +103,47 @@ def view_image(path: str) -> ImageToolResult:
     'content': f'Attached image: {image_path.name}',
     'images': [image]
   }
+
+@contextmanager
+def mounted_workspace(work_dir: Path) -> Iterator[Path]:
+  """Expose the automatic UTM work share at the guest's ~/work path."""
+  workspace = work_dir.expanduser().absolute()
+  workspace.mkdir(parents=True, exist_ok=True)
+  if workspace.is_symlink() or os.path.ismount(workspace) or any(workspace.iterdir()):
+    raise RuntimeError(
+      f'Workspace mount directory must be empty and unmounted: {workspace}'
+    )
+
+  automatic_share = Path('/Volumes/My Shared Files')
+  if not os.path.ismount(automatic_share):
+    raise RuntimeError(
+      'UTM shared folder is not mounted at /Volumes/My Shared Files. '
+      'Check the UTM sharing settings and restart the VM.'
+    )
+  shares = [entry for entry in automatic_share.iterdir()
+            if entry.is_dir()
+            and entry.name not in {'.Spotlight-V100', '.Trashes', '.fseventsd'}]
+  if len(shares) != 2 or {share.name for share in shares} != {'harness', 'work'}:
+    raise RuntimeError(
+      'Expected the harness and work shares in /Volumes/My Shared Files'
+    )
+  work_share = automatic_share / 'work'
+  if not work_share.is_dir():
+    raise RuntimeError('The work share is not mounted as /Volumes/My Shared Files/work')
+  workspace.rmdir()
+  try:
+    workspace.symlink_to(work_share, target_is_directory=True)
+  except OSError:
+    workspace.mkdir()
+    raise
+
+  try:
+    if not os.access(workspace, os.W_OK):
+      raise RuntimeError('Workspace share is not writable')
+    yield workspace.resolve()
+  finally:
+    workspace.unlink()
+    workspace.mkdir()
 
 TOOLS_SCHEMA = [
   {
@@ -305,7 +351,7 @@ def handle_prompt(messages: list[dict[str, Any]], writer: IO[str]) -> None:
 
       messages.append(tool_msg)
 
-def run_worker(host_port: int, system_prompt: str) -> None:
+def run_worker(host_port: int, system_prompt: str, startup_message: str) -> None:
   messages = []
   if system_prompt:
     messages.append({'role': 'system', 'content': system_prompt})
@@ -318,10 +364,19 @@ def run_worker(host_port: int, system_prompt: str) -> None:
     writer = conn.makefile('w', encoding='utf-8')
 
     with reader, writer:
-      send_event(writer, {'type': 'ready'})
+      send_event(writer, {'type': 'ready', 'text': startup_message})
 
-      # The loop ends when the host closes the connection
-      for line in reader:
+      # The session ends when either the host callback or the LaunchAgent
+      # session closes. Watching stdin lets the latter trigger workspace cleanup.
+      while True:
+        readable, _, _ = select.select([conn, sys.stdin], [], [])
+        if sys.stdin in readable and not os.read(sys.stdin.fileno(), 4096):
+          break
+        if conn not in readable:
+          continue
+        line = reader.readline()
+        if not line:
+          break
         try:
           request = json.loads(line)
           prompt = request.get('prompt')
@@ -339,27 +394,35 @@ def run_worker(host_port: int, system_prompt: str) -> None:
 
 def main() -> None:
   parser = argparse.ArgumentParser()
-  parser.add_argument('--work-dir', type=Path, default=Path('/work'))
+  parser.add_argument('--work-dir', type=Path, required=True)
+  # Older guest LaunchAgents pass this option; the workspace is now always ~/work.
+  parser.add_argument('--project-relative', type=Path, default=Path('.'))
   parser.add_argument('--host-port', type=int, required=True)
   parser.add_argument('--host-address', default='127.0.0.1')
   parser.add_argument('--ollama-url', default='http://127.0.0.1:11435/api/chat')
 
   args = parser.parse_args()
+  def stop(signum: int, frame: FrameType | None) -> None:
+    del frame
+    raise SystemExit(128 + signum)
+
+  for signum in (signal.SIGHUP, signal.SIGTERM, signal.SIGINT):
+    signal.signal(signum, stop)
+
   global HOSTNAME, OLLAMA_URL, WORK_DIR
-  WORK_DIR = args.work_dir.expanduser().resolve()
-  if not WORK_DIR.is_dir():
-    parser.error(f'workspace is not a directory: {WORK_DIR}')
   HOSTNAME = args.host_address
   OLLAMA_URL = args.ollama_url
-  agents_file = WORK_DIR / 'AGENTS.md'
-  if agents_file.is_file():
-    system_prompt = agents_file.read_text(encoding='utf-8')
-    print(f'Loaded AGENTS.md from {agents_file.resolve()}', end='\n\n', flush=True)
-  else:
-    system_prompt = ''
-    print(f'No AGENTS.md found at {agents_file.resolve()}', end='\n\n', flush=True)
+  with mounted_workspace(Path.home() / 'work') as workspace:
+    WORK_DIR = workspace
+    agents_file = WORK_DIR / 'AGENTS.md'
+    if agents_file.is_file():
+      system_prompt = agents_file.read_text(encoding='utf-8')
+      startup_message = f'Loaded AGENTS.md from {agents_file.resolve()}'
+    else:
+      system_prompt = ''
+      startup_message = f'No AGENTS.md found at {agents_file.resolve()}'
 
-  run_worker(args.host_port, system_prompt)
+    run_worker(args.host_port, system_prompt, startup_message)
 
 if __name__ == '__main__':
   main()
